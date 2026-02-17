@@ -66,6 +66,9 @@ user = Client(
 RUNNING_TASKS = set()
 download_semaphore = None
 BATCH_STATES = {}  # Stores state for user interactions: {user_id: {'step': '...', 'data': ...}}
+STOP_ALL_PROCESSES = False
+FLOODWAIT_SHUTDOWN_TRIGGERED = False
+FLOODWAIT_SHUTDOWN_LOCK = asyncio.Lock()
 
 # GLOBAL SETTING FOR DESTINATION CHANNEL
 DESTINATION_CHAT_ID = None
@@ -105,6 +108,37 @@ def track_task(coro):
         RUNNING_TASKS.discard(task)
     task.add_done_callback(_remove)
     return task
+
+
+async def trigger_floodwait_shutdown(message: Optional[Message], wait_seconds: int):
+    global FLOODWAIT_SHUTDOWN_TRIGGERED
+
+    async with FLOODWAIT_SHUTDOWN_LOCK:
+        if FLOODWAIT_SHUTDOWN_TRIGGERED:
+            return
+        FLOODWAIT_SHUTDOWN_TRIGGERED = True
+
+        shutdown_text = (
+            "❌ **FloodWait occurred.**\n"
+            f"⏳ **FloodWait time:** `{wait_seconds}` seconds\n"
+            "🛑 **Stopping all tasks and exiting process now.**"
+        )
+
+        try:
+            if message:
+                await bot.send_message(message.chat.id, shutdown_text)
+        except Exception as notify_error:
+            LOGGER(__name__).error(f"Failed to send FloodWait shutdown message: {notify_error}")
+
+        LOGGER(__name__).error(f"FloodWait occurred ({wait_seconds}s). Exiting process.")
+
+        BATCH_STATES.clear()
+        for task in list(RUNNING_TASKS):
+            if not task.done():
+                task.cancel()
+
+    await asyncio.sleep(1)
+    os._exit(1)
 
 
 def build_batch_progress_text(
@@ -176,6 +210,7 @@ async def help_command(_, message: Message):
         "   – Make sure the user client is part of the chat.\n\n"
         "➤ **Management**\n"
         "   – `/killall` : Cancel all running tasks.\n"
+        "   – `/stop` : Stop all running tasks and block new processing.\n"
         "   – `/logs` : Get log file.\n"
         "   – `/stats` : System status.\n"
     )
@@ -279,6 +314,11 @@ async def handle_download(
     destination_chat_id: Optional[int] = None,
     batch_label: Optional[str] = None
 ):
+    if STOP_ALL_PROCESSES:
+        if not silent:
+            await message.reply("🛑 **All processes are stopped.**")
+        return
+
     async with download_semaphore:
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
@@ -537,6 +577,9 @@ async def handle_download(
                 if not silent:
                     await message.reply("**No media or text found in the post URL.**")
 
+        except FloodWait as e:
+            await trigger_floodwait_shutdown(message, e.value)
+            return
         except (PeerIdInvalid, BadRequest, KeyError):
             if not silent:
                 await message.reply(f"**Error processing {post_url}: User client likely not in chat.**")
@@ -549,6 +592,10 @@ async def handle_download(
 
 @bot.on_message(filters.command("dl") & filters.private)
 async def download_media(bot: Client, message: Message):
+    if STOP_ALL_PROCESSES:
+        await message.reply("🛑 **All processes are stopped.**")
+        return
+
     if len(message.command) < 2:
         await message.reply("**Provide a post URL after the /dl command.**")
         return
@@ -562,6 +609,10 @@ async def download_media(bot: Client, message: Message):
 # -------------------------------------------------------------------------------------
 @bot.on_message(filters.regex(r"^/batch(\d+)?(?:\s|$)") & filters.private)
 async def batch_command_start(bot: Client, message: Message):
+    if STOP_ALL_PROCESSES:
+        await message.reply("🛑 **All processes are stopped.**")
+        return
+
     if not message.text:
         return
 
@@ -586,8 +637,12 @@ async def batch_command_start(bot: Client, message: Message):
 
 
 # Generic Text Handler (Handles both single links AND batch conversation steps)
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall", "set"]))
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall", "stop", "set"]))
 async def handle_text_and_states(bot: Client, message: Message):
+    if STOP_ALL_PROCESSES:
+        await message.reply("🛑 **All processes are stopped.**")
+        return
+
     if message.text and message.text.startswith(("/batch", "/set")):
         return
 
@@ -644,6 +699,9 @@ async def execute_batch_logic(
     count: int,
     set_key: Optional[str] = None
 ):
+    if STOP_ALL_PROCESSES:
+        return await message.reply("🛑 **All processes are stopped.**")
+
     try:
         start_chat, start_id = getChatMsgID(start_link)
     except Exception as e:
@@ -694,15 +752,19 @@ async def execute_batch_logic(
         )
 
     for msg_id in range(start_id, end_id + 1):
+        if STOP_ALL_PROCESSES:
+            await loading.delete()
+            await progress_message.delete()
+            return await message.reply("🛑 **Batch stopped.**")
+
         url = f"{prefix}/{msg_id}"
         try:
             # Check if message exists/is empty
             try:
                 chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
             except FloodWait as e:
-                LOGGER(__name__).warning(f"FloodWait while fetching {url}. Sleeping {e.value}s.")
-                await asyncio.sleep(e.value)
-                chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
+                await trigger_floodwait_shutdown(message, e.value)
+                return
 
             if not chat_msg:
                 skipped += 1
@@ -842,12 +904,32 @@ async def cancel_all_tasks(_, message: Message):
     # Clear state if any
     if message.from_user.id in BATCH_STATES:
         del BATCH_STATES[message.from_user.id]
-        
+
     for task in list(RUNNING_TASKS):
         if not task.done():
             task.cancel()
             cancelled += 1
     await message.reply(f"**Cancelled {cancelled} running task(s).**")
+
+
+@bot.on_message(filters.command("stop") & filters.private)
+async def stop_all_processes(_, message: Message):
+    global STOP_ALL_PROCESSES
+
+    STOP_ALL_PROCESSES = True
+    BATCH_STATES.clear()
+
+    cancelled = 0
+    for task in list(RUNNING_TASKS):
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+
+    await message.reply(
+        "🛑 **Stop command executed.**\n"
+        f"Cancelled `{cancelled}` running task(s).\n"
+        "New downloads/batches are now blocked until process restart."
+    )
 
 
 async def initialize():
