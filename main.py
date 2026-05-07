@@ -1,16 +1,9 @@
-
-
 import os
-import re
 import shutil
 import psutil
 import asyncio
 from time import time
 from aiohttp import web
-from typing import Optional
-
-# Removed pyleaves import
-# from pyleaves import Leaves
 
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
@@ -50,7 +43,7 @@ bot = Client(
     bot_token=PyroConf.BOT_TOKEN,
     workers=100,
     parse_mode=ParseMode.MARKDOWN,
-    max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
+    max_concurrent_transmissions=1,
     sleep_threshold=30,
 )
 
@@ -59,47 +52,16 @@ user = Client(
     "user_session",
     workers=100,
     session_string=PyroConf.SESSION_STRING,
-    max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
+    max_concurrent_transmissions=1,
     sleep_threshold=30,
 )
 
 RUNNING_TASKS = set()
 download_semaphore = None
 BATCH_STATES = {}  # Stores state for user interactions: {user_id: {'step': '...', 'data': ...}}
-STOP_ALL_PROCESSES = False
-FLOODWAIT_SHUTDOWN_TRIGGERED = False
-FLOODWAIT_SHUTDOWN_LOCK = asyncio.Lock()
 
 # GLOBAL SETTING FOR DESTINATION CHANNEL
 DESTINATION_CHAT_ID = None
-DESTINATION_SETS = {}
-
-def should_ping_destination(message: Message) -> bool:
-    if message.reply_to_message:
-        return True
-    if not message.entities:
-        return False
-    return any(entity.type in ("mention", "text_mention") for entity in message.entities)
-
-
-async def send_ping_notice(message: Message, target_chat_id: int, forward_messages):
-    if not should_ping_destination(message):
-        return
-    if not forward_messages:
-        return
-    if isinstance(forward_messages, list):
-        target_message = forward_messages[0]
-    else:
-        target_message = forward_messages
-    try:
-        ping_text = f"🔔 Ping from {message.from_user.mention}"
-        await bot.send_message(
-            target_chat_id,
-            ping_text,
-            reply_to_message_id=target_message.id
-        )
-    except Exception as e:
-        LOGGER(__name__).info(f"Ping notice failed: {e}")
 
 def track_task(coro):
     task = asyncio.create_task(coro)
@@ -108,59 +70,6 @@ def track_task(coro):
         RUNNING_TASKS.discard(task)
     task.add_done_callback(_remove)
     return task
-
-
-async def trigger_floodwait_shutdown(message: Optional[Message], wait_seconds: int):
-    global FLOODWAIT_SHUTDOWN_TRIGGERED
-
-    async with FLOODWAIT_SHUTDOWN_LOCK:
-        if FLOODWAIT_SHUTDOWN_TRIGGERED:
-            return
-        FLOODWAIT_SHUTDOWN_TRIGGERED = True
-
-        shutdown_text = (
-            "❌ **FloodWait occurred.**\n"
-            f"⏳ **FloodWait time:** `{wait_seconds}` seconds\n"
-            "🛑 **Stopping all tasks and exiting process now.**"
-        )
-
-        try:
-            if message:
-                await bot.send_message(message.chat.id, shutdown_text)
-        except Exception as notify_error:
-            LOGGER(__name__).error(f"Failed to send FloodWait shutdown message: {notify_error}")
-
-        LOGGER(__name__).error(f"FloodWait occurred ({wait_seconds}s). Exiting process.")
-
-        BATCH_STATES.clear()
-        for task in list(RUNNING_TASKS):
-            if not task.done():
-                task.cancel()
-
-    await asyncio.sleep(1)
-    os._exit(1)
-
-
-def build_batch_progress_text(
-    processed: int,
-    total: int,
-    downloaded: int,
-    skipped: int,
-    failed: int,
-    batch_label: str
-) -> str:
-    percentage = 0 if total == 0 else (processed * 100) / total
-    bar_len = 20
-    filled = int(percentage / 100 * bar_len)
-    bar = "▓" * filled + "░" * (bar_len - filled)
-    return (
-        f"**{batch_label} Progress**\n"
-        f"{bar} `{percentage:.2f}%`\n\n"
-        f"📌 **Processed** : `{processed}` / `{total}`\n"
-        f"📥 **Downloaded** : `{downloaded}`\n"
-        f"⏭️ **Skipped** : `{skipped}`\n"
-        f"❌ **Failed** : `{failed}`"
-    )
 
 
 @bot.on_message(filters.command("start") & filters.private)
@@ -172,8 +81,7 @@ async def start(_, message: Message):
         "or reply to a message with `/dl`.\n\n"
         "**New Feature:**\n"
         "Use `/batch` to clone/download multiple messages easily!\n"
-        "Use `/set <channel_id>` to set a custom upload destination.\n"
-        "Use `/set1 <channel_id>` + `/batch1` for multiple destinations.\n\n"
+        "Use `/set <channel_id>` to set a custom upload destination.\n\n"
         "ℹ️ Use `/help` to view all commands and examples.\n"
         "🔒 Make sure the user client is part of the chat.\n\n"
         "Ready? Send me a Telegram post link!"
@@ -196,21 +104,14 @@ async def help_command(_, message: Message):
         "   2. Send the **Start Link**\n"
         "   3. Send the **Number of Messages** (e.g., 100)\n"
         "   The bot will calculate the range and process them.\n\n"
-        "➤ **Batch Process (Multiple Destinations)**\n"
-        "   1. Send `/set1 <channel_id>` (repeat for `/set2`, `/set3`, ...)\n"
-        "   2. Send `/batch1` (or `/batch2`, ...)\n"
-        "   3. Follow the same steps as `/batch`\n\n"
         "➤ **Destination Settings**\n"
         "   – `/set -100xxxx`: Set a channel for uploads.\n"
-        "   – `/set1 -100xxxx`: Set destination for batch1.\n"
         "   – `/set none`: Reset to default (upload to this chat).\n"
-        "   – `/set1 none`: Reset destination for batch1.\n"
         "     *Note: Bot must be admin in the target channel.*\n\n"
         "➤ **Requirements**\n"
         "   – Make sure the user client is part of the chat.\n\n"
         "➤ **Management**\n"
         "   – `/killall` : Cancel all running tasks.\n"
-        "   – `/stop` : Stop all running tasks and block new processing.\n"
         "   – `/logs` : Get log file.\n"
         "   – `/stats` : System status.\n"
     )
@@ -223,56 +124,34 @@ async def help_command(_, message: Message):
 # -------------------------------------------------------------------------------------
 # DESTINATION CHANNEL SETTING
 # -------------------------------------------------------------------------------------
-@bot.on_message(filters.regex(r"^/set(\d+)?(?:\s|$)") & filters.private)
+@bot.on_message(filters.command("set") & filters.private)
 async def set_destination(bot: Client, message: Message):
     global DESTINATION_CHAT_ID
-
-    if not message.text:
+    
+    if len(message.command) < 2:
+        await message.reply(
+            "❌ **Usage:** `/set <channel_id>`\n"
+            "Example: `/set -100123456789`\n"
+            "To reset: `/set none`"
+        )
         return
 
-    match = re.match(r"^/set(\d+)?(?:\s+|$)(.*)", message.text.strip())
-    if not match:
-        return
-    set_key = match.group(1) or None
-    input_arg = match.group(2).strip()
-
-    if not input_arg:
-        base_usage = "❌ **Usage:** `/set <channel_id>`\nExample: `/set -100123456789`\nTo reset: `/set none`"
-        if set_key:
-            base_usage = (
-                f"❌ **Usage:** `/set{set_key} <channel_id>`\n"
-                f"Example: `/set{set_key} -100123456789`\n"
-                f"To reset: `/set{set_key} none`"
-            )
-        await message.reply(base_usage)
-        return
+    input_arg = message.command[1]
 
     if input_arg.lower() == "none":
-        if set_key:
-            DESTINATION_SETS.pop(set_key, None)
-            await message.reply(
-                f"✅ **Destination removed for set {set_key}.**"
-            )
-        else:
-            DESTINATION_CHAT_ID = None
-            await message.reply("✅ **Destination removed.** Files will be sent to this chat.")
+        DESTINATION_CHAT_ID = None
+        await message.reply("✅ **Destination removed.** Files will be sent to this chat.")
         return
 
     try:
-        # Attempt to interpret as integer ID
         try:
             target_id = int(input_arg)
         except ValueError:
-            # Fallback: maybe a username?
             chat_obj = await bot.get_chat(input_arg)
             target_id = chat_obj.id
 
-        # Verify bot permissions by sending a test message
         try:
             sent_msg = await bot.send_message(target_id, "✅ **Destination Channel Connected Successfully!**")
-            # Optional: delete the test message after a few seconds
-            # await asyncio.sleep(5)
-            # await sent_msg.delete()
         except Exception as e:
             await message.reply(
                 f"❌ **Failed to connect to channel `{target_id}`**.\n\n"
@@ -281,112 +160,39 @@ async def set_destination(bot: Client, message: Message):
             )
             return
 
-        if set_key:
-            DESTINATION_SETS[set_key] = target_id
-            await message.reply(
-                f"✅ **Destination Set for set {set_key}!**\n"
-                f"Uploads for `/batch{set_key}` will go to ID: `{target_id}`"
-            )
-            LOGGER(__name__).info(
-                f"Destination set {set_key} set to {target_id} by user {message.from_user.id}"
-            )
-        else:
-            DESTINATION_CHAT_ID = target_id
-            await message.reply(
-                f"✅ **Destination Channel Set!**\nAll downloads will now be uploaded to ID: `{target_id}`"
-            )
-            LOGGER(__name__).info(
-                f"Destination channel set to {target_id} by user {message.from_user.id}"
-            )
+        DESTINATION_CHAT_ID = target_id
+        await message.reply(f"✅ **Destination Channel Set!**\nAll downloads will now be uploaded to ID: `{target_id}`")
+        LOGGER(__name__).info(f"Destination channel set to {target_id} by user {message.from_user.id}")
 
     except Exception as e:
         await message.reply(f"❌ **Error:** {str(e)}")
 
 
 # -------------------------------------------------------------------------------------
-# CORE DOWNLOAD LOGIC (With Cloning)
+# CORE DOWNLOAD LOGIC
 # -------------------------------------------------------------------------------------
-async def handle_download(
-    bot: Client,
-    message: Message,
-    post_url: str,
-    silent: bool = False,
-    destination_chat_id: Optional[int] = None,
-    batch_label: Optional[str] = None
-):
-    if STOP_ALL_PROCESSES:
-        if not silent:
-            await message.reply("🛑 **All processes are stopped.**")
-        return
-
+async def handle_download(bot: Client, message: Message, post_url: str, silent: bool = False):
     async with download_semaphore:
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
 
-        # Determine target chat
-        target_chat_id = destination_chat_id or DESTINATION_CHAT_ID or message.chat.id
+        target_chat_id = DESTINATION_CHAT_ID if DESTINATION_CHAT_ID else message.chat.id
 
         try:
-            chat_id, message_id = getChatMsgID(post_url)
+            # Updated to unpack the 3 elements
+            chat_id, message_id, thread_id = getChatMsgID(post_url)
             chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
             
             LOGGER(__name__).info(f"Processing URL: {post_url}")
-
-            # --- 0. DIRECT FORWARD FOR PRIVATE CHATS (If Forwarding Allowed) ---
-            is_private_chat = getattr(chat_message.chat, "type", None) == "private"
-            has_protected_content = getattr(chat_message.chat, "has_protected_content", False)
-            if is_private_chat and not has_protected_content:
-                try:
-                    forwarded = None
-                    if chat_message.media_group_id:
-                        media_group = await user.get_media_group(chat_id=chat_id, message_id=message_id)
-                        media_ids = [msg.id for msg in media_group]
-                        forwarded = await user.forward_messages(target_chat_id, chat_id, media_ids)
-                    else:
-                        forwarded = await user.forward_messages(target_chat_id, chat_id, message_id)
-                    await send_ping_notice(message, target_chat_id, forwarded)
-                    LOGGER(__name__).info(f"Forwarded from private chat via User: {post_url}")
-                    return
-                except Exception as e_user_forward:
-                    LOGGER(__name__).info(f"User forward failed: {e_user_forward}")
-                    try:
-                        forwarded = None
-                        if chat_message.media_group_id:
-                            media_group = await bot.get_media_group(chat_id=chat_id, message_id=message_id)
-                            media_ids = [msg.id for msg in media_group]
-                            forwarded = await bot.forward_messages(target_chat_id, chat_id, media_ids)
-                        else:
-                            forwarded = await bot.forward_messages(target_chat_id, chat_id, message_id)
-                        await send_ping_notice(message, target_chat_id, forwarded)
-                        LOGGER(__name__).info(f"Forwarded from private chat via Bot: {post_url}")
-                        return
-                    except Exception as e_bot_forward:
-                        LOGGER(__name__).info(f"Bot forward failed: {e_bot_forward}")
-
-            # --- 1. TRY DIRECT CLONE (Optimization) ---
-            # Strategies:
-            # A. User -> Destination (Fastest, requires User to be Admin in Dest)
-            # B. Bot -> Destination (Fastest, requires Bot to be in Source)
-            # C. User -> Bot -> Destination (Relay, requires Source to be Cloneable)
             
             cloned = False
             
             # ATTEMPT A: User Client Direct
             try:
-                forwarded = None
                 if chat_message.media_group_id:
-                    forwarded = await user.copy_media_group(
-                        chat_id=target_chat_id,
-                        from_chat_id=chat_id,
-                        message_id=message_id
-                    )
+                    await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 else:
-                    forwarded = await user.copy_message(
-                        chat_id=target_chat_id,
-                        from_chat_id=chat_id,
-                        message_id=message_id
-                    )
-                await send_ping_notice(message, target_chat_id, forwarded)
+                    await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 cloned = True
                 LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
             except Exception as e_user:
@@ -394,20 +200,10 @@ async def handle_download(
 
                 # ATTEMPT B: Bot Client Direct
                 try:
-                    forwarded = None
                     if chat_message.media_group_id:
-                        forwarded = await bot.copy_media_group(
-                            chat_id=target_chat_id,
-                            from_chat_id=chat_id,
-                            message_id=message_id
-                        )
+                        await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                     else:
-                        forwarded = await bot.copy_message(
-                            chat_id=target_chat_id,
-                            from_chat_id=chat_id,
-                            message_id=message_id
-                        )
-                    await send_ping_notice(message, target_chat_id, forwarded)
+                        await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                     cloned = True
                     LOGGER(__name__).info(f"Directly cloned via Bot: {post_url}")
                 except Exception as e_bot:
@@ -421,56 +217,45 @@ async def handle_download(
                         bot_username = bot.me.username
                         LOGGER(__name__).info(f"Attempting Relay Clone via {bot_username}...")
 
-                        forwarded = None
                         if chat_message.media_group_id:
-                            # 1. User copies to Bot
                             relayed_msgs = await user.copy_media_group(
                                 chat_id=bot_username,
                                 from_chat_id=chat_id,
                                 message_id=message_id
                             )
-                            # 2. Bot copies to Destination
                             if relayed_msgs:
-                                forwarded = await bot.copy_media_group(
+                                await bot.copy_media_group(
                                     chat_id=target_chat_id,
                                     from_chat_id=bot.me.id,
                                     message_id=relayed_msgs[0].id
                                 )
                         else:
-                            # 1. User copies to Bot
                             relayed_msg = await user.copy_message(
                                 chat_id=bot_username,
                                 from_chat_id=chat_id,
                                 message_id=message_id
                             )
-                            # 2. Bot copies to Destination
-                            forwarded = await bot.copy_message(
+                            await bot.copy_message(
                                 chat_id=target_chat_id,
                                 from_chat_id=bot.me.id,
                                 message_id=relayed_msg.id
                             )
-                            # 3. Cleanup
                             try:
                                 await relayed_msg.delete()
                             except:
                                 pass
 
-                        await send_ping_notice(message, target_chat_id, forwarded)
                         cloned = True
                         LOGGER(__name__).info(f"Relay clone success: {post_url}")
 
                     except Exception as e_relay:
                         LOGGER(__name__).info(f"Relay clone failed: {e_relay}")
 
-            # If any clone attempt worked, exit early
             if cloned:
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
                 return 
-            # ------------------------------------------
 
-            # --- 2. FALLBACK: DOWNLOAD & UPLOAD ---
-            # LOGGER(__name__).info("All clone methods failed. Falling back to Download & Upload.")
-            
+            # FALLBACK: DOWNLOAD & UPLOAD
             if chat_message.document or chat_message.video or chat_message.audio:
                 file_size = (
                     chat_message.document.file_size
@@ -503,15 +288,10 @@ async def handle_download(
             elif chat_message.media:
                 start_time = time()
                 
-                # --- NEW LOGIC: Generic Start Message + ID in Progress Header ---
                 if not silent:
-                    # We send a generic message to initialize the progress bar container
                     progress_message = await message.reply("**⏳ Initializing...**")
                     progress_func = progress_for_pyrogram
-                    # Inject the ID into the Action Header string
                     progress_action_str = f"📥 Downloading (ID: {message_id})"
-                    if batch_label:
-                        progress_action_str = f"{batch_label} {progress_action_str}"
                     prog_args = progressArgs(progress_action_str, progress_message, start_time)
                 else:
                     progress_message = None
@@ -523,8 +303,8 @@ async def handle_download(
 
                 media_path = await chat_message.download(
                     file_name=download_path,
-                    progress=progress_func, # Use the variable
-                    progress_args=prog_args, # Use the variable
+                    progress=progress_func,
+                    progress_args=prog_args, 
                 )
 
                 if not media_path or not os.path.exists(media_path):
@@ -555,20 +335,17 @@ async def handle_download(
                     media_path,
                     media_type,
                     parsed_caption,
-                    progress_message, # Pass None if silent
+                    progress_message, 
                     start_time,
-                    destination_chat_id=target_chat_id,
-                    action_prefix=batch_label
+                    destination_chat_id=target_chat_id
                 )
 
                 cleanup_download(media_path)
                 
-                # Only delete if we actually sent a status message
                 if progress_message:
                     await progress_message.delete()
 
             elif chat_message.text or chat_message.caption:
-                # Send text to target chat
                 if target_chat_id != message.chat.id:
                     await bot.send_message(target_chat_id, parsed_text or parsed_caption)
                 else:
@@ -577,9 +354,6 @@ async def handle_download(
                 if not silent:
                     await message.reply("**No media or text found in the post URL.**")
 
-        except FloodWait as e:
-            await trigger_floodwait_shutdown(message, e.value)
-            return
         except (PeerIdInvalid, BadRequest, KeyError):
             if not silent:
                 await message.reply(f"**Error processing {post_url}: User client likely not in chat.**")
@@ -592,72 +366,36 @@ async def handle_download(
 
 @bot.on_message(filters.command("dl") & filters.private)
 async def download_media(bot: Client, message: Message):
-    if STOP_ALL_PROCESSES:
-        await message.reply("🛑 **All processes are stopped.**")
-        return
-
     if len(message.command) < 2:
         await message.reply("**Provide a post URL after the /dl command.**")
         return
     post_url = message.command[1]
-    # Single download is NOT silent, so we see progress bars
     await track_task(handle_download(bot, message, post_url, silent=False))
 
 
 # -------------------------------------------------------------------------------------
 # NEW /BATCH INTERACTIVE FLOW
 # -------------------------------------------------------------------------------------
-@bot.on_message(filters.regex(r"^/batch(\d+)?(?:\s|$)") & filters.private)
+@bot.on_message(filters.command("batch") & filters.private)
 async def batch_command_start(bot: Client, message: Message):
-    if STOP_ALL_PROCESSES:
-        await message.reply("🛑 **All processes are stopped.**")
-        return
-
-    if not message.text:
-        return
-
-    match = re.match(r"^/batch(\d+)?(?:\s|$)", message.text.strip())
-    if not match:
-        return
-    set_key = match.group(1) or None
-
-    if set_key and set_key not in DESTINATION_SETS:
-        await message.reply(
-            f"❌ **Set {set_key} is not configured.**\n"
-            f"Use `/set{set_key} <channel_id>` first."
-        )
-        return
-
-    # Set initial state
-    BATCH_STATES[message.from_user.id] = {'step': 'ask_link', 'set_key': set_key}
+    BATCH_STATES[message.from_user.id] = {'step': 'ask_link'}
     await message.reply(
         "🚀 **Batch Mode Initiated**\n\n"
         "Please send the **Start Link** of the first post you want to download."
     )
 
 
-# Generic Text Handler (Handles both single links AND batch conversation steps)
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall", "stop", "set"]))
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall", "set"]))
 async def handle_text_and_states(bot: Client, message: Message):
-    if STOP_ALL_PROCESSES:
-        await message.reply("🛑 **All processes are stopped.**")
-        return
-
-    if message.text and message.text.startswith(("/batch", "/set")):
-        return
-
-    # 1. Check if user is in a Batch conversation
     user_id = message.from_user.id
     state = BATCH_STATES.get(user_id)
 
     if state:
-        # --- Step 1: User sent the Link ---
         if state['step'] == 'ask_link':
             if not message.text.startswith("https://t.me/"):
                 await message.reply("❌ Invalid link. Please send a valid Telegram post link (e.g., https://t.me/channel/100).")
                 return
             
-            # Store link and move to next step
             BATCH_STATES[user_id]['start_link'] = message.text
             BATCH_STATES[user_id]['step'] = 'ask_count'
             await message.reply(
@@ -667,7 +405,6 @@ async def handle_text_and_states(bot: Client, message: Message):
             )
             return
 
-        # --- Step 2: User sent the Count ---
         elif state['step'] == 'ask_count':
             if not message.text.isdigit():
                 await message.reply("❌ Please send a valid number.")
@@ -675,35 +412,21 @@ async def handle_text_and_states(bot: Client, message: Message):
             
             count = int(message.text)
             start_link = BATCH_STATES[user_id]['start_link']
-            set_key = BATCH_STATES[user_id].get('set_key')
             
-            # Clean up state
             del BATCH_STATES[user_id]
             
-            # Execute Batch in background so multiple batches can run in parallel
-            track_task(
-                execute_batch_logic(bot, message, start_link, count, set_key=set_key)
-            )
+            await execute_batch_logic(bot, message, start_link, count)
             return
 
-    # 2. If not in state, treat as a single download link (if it looks like a link)
     if message.text and not message.text.startswith("/"):
         await track_task(handle_download(bot, message, message.text, silent=False))
 
 
 # Helper to run the batch loop
-async def execute_batch_logic(
-    bot: Client,
-    message: Message,
-    start_link: str,
-    count: int,
-    set_key: Optional[str] = None
-):
-    if STOP_ALL_PROCESSES:
-        return await message.reply("🛑 **All processes are stopped.**")
-
+async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int):
     try:
-        start_chat, start_id = getChatMsgID(start_link)
+        # Extract thread ID here to filter by later
+        start_chat, start_id, start_thread_id = getChatMsgID(start_link)
     except Exception as e:
         return await message.reply(f"**❌ Error parsing start link:\n{e}**")
 
@@ -712,11 +435,12 @@ async def execute_batch_logic(
     
     prefix = start_link.rsplit("/", 1)[0]
     
+    thread_text = f"\n**Topic/Thread Filter Active**: ID `{start_thread_id}`" if start_thread_id else ""
     loading = await message.reply(
         f"📥 **Starting Batch Process**\n"
         f"From: `{start_id}`\n"
         f"To: `{end_id}`\n"
-        f"Total: `{count}` posts"
+        f"Total Range Checked: `{count}` posts{thread_text}"
     )
 
     downloaded = skipped = failed = 0
@@ -724,64 +448,43 @@ async def execute_batch_logic(
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
 
-    destination_chat_id = DESTINATION_SETS.get(set_key) if set_key else DESTINATION_CHAT_ID
-    batch_label = f"BATCH{set_key}" if set_key else "BATCH"
-
-    processed = 0
-    progress_message = await message.reply(
-        build_batch_progress_text(
-            processed=processed,
-            total=count,
-            downloaded=downloaded,
-            skipped=skipped,
-            failed=failed,
-            batch_label=batch_label
-        )
-    )
-
-    async def update_batch_progress():
-        await progress_message.edit(
-            build_batch_progress_text(
-                processed=processed,
-                total=count,
-                downloaded=downloaded,
-                skipped=skipped,
-                failed=failed,
-                batch_label=batch_label
-            )
-        )
-
     for msg_id in range(start_id, end_id + 1):
-        if STOP_ALL_PROCESSES:
-            await loading.delete()
-            await progress_message.delete()
-            return await message.reply("🛑 **Batch stopped.**")
-
         url = f"{prefix}/{msg_id}"
         try:
-            # Check if message exists/is empty
             try:
                 chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
             except FloodWait as e:
-                await trigger_floodwait_shutdown(message, e.value)
-                return
+                LOGGER(__name__).warning(f"FloodWait while fetching {url}. Sleeping {e.value}s.")
+                await asyncio.sleep(e.value)
+                chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
 
-            if not chat_msg:
+            if not chat_msg or getattr(chat_msg, 'empty', False):
                 skipped += 1
-                processed += 1
-                await update_batch_progress()
                 skipped_streak += 1
                 if skipped_streak >= BATCH_SIZE:
                     await asyncio.sleep(4)
                     skipped_streak = 0
                 continue
 
+            # ------------- NEW: TOPIC FILTERING -------------
+            if start_thread_id:
+                # Get the thread ID of the fetched message
+                msg_thread = getattr(chat_msg, "message_thread_id", None)
+                
+                # If it doesn't belong to the requested Topic/Thread, skip it!
+                if msg_thread != start_thread_id:
+                    skipped += 1
+                    skipped_streak += 1
+                    if skipped_streak >= BATCH_SIZE:
+                        await asyncio.sleep(4)
+                        skipped_streak = 0
+                    continue
+            # ------------------------------------------------
+
             has_media = bool(chat_msg.media_group_id or chat_msg.media)
             has_text  = bool(chat_msg.text or chat_msg.caption)
             if not (has_media or has_text):
                 skipped += 1
-                processed += 1
-                await update_batch_progress()
                 skipped_streak += 1
                 if skipped_streak >= BATCH_SIZE:
                     await asyncio.sleep(4)
@@ -789,30 +492,14 @@ async def execute_batch_logic(
                 continue
             skipped_streak = 0
 
-            # Spawn task - Enable Silent Mode for Batch to avoid FloodWait!
-            # Change silent=False to silent=True if you want completely silent batch
-            # But user wants progress bars. If user wants progress bars, we MUST use silent=False
-            # BUT we implemented the 25s delay in utils.py so it is SAFE now.
-            # So we set silent=False here to show bars as requested.
-            task = track_task(
-                handle_download(
-                    bot,
-                    message,
-                    url,
-                    silent=False,
-                    destination_chat_id=destination_chat_id,
-                    batch_label=batch_label
-                )
-            )
+            task = track_task(handle_download(bot, message, url, silent=False))
             batch_tasks.append(task)
 
-            # Wait if batch size reached
             if len(batch_tasks) >= BATCH_SIZE:
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
                 for result in results:
                     if isinstance(result, asyncio.CancelledError):
                         await loading.delete()
-                        await progress_message.delete()
                         return await message.reply(
                             f"**❌ Batch canceled** after processing `{downloaded}` posts."
                         )
@@ -821,21 +508,14 @@ async def execute_batch_logic(
                         LOGGER(__name__).error(f"Error: {result}")
                     else:
                         downloaded += 1
-                    processed += 1
-
-                await update_batch_progress()
 
                 batch_tasks.clear()
-                # Flood wait to be safe
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
         except Exception as e:
             failed += 1
-            processed += 1
-            await update_batch_progress()
             LOGGER(__name__).error(f"Error at {url}: {e}")
 
-    # Process remaining tasks
     if batch_tasks:
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
         for result in results:
@@ -843,16 +523,12 @@ async def execute_batch_logic(
                 failed += 1
             else:
                 downloaded += 1
-            processed += 1
-
-        await update_batch_progress()
 
     await loading.delete()
-    await progress_message.delete()
     await message.reply(
         "**✅ Batch Process Complete!**\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 **Processed** : `{processed}`\n"
+        f"📥 **Processed** : `{downloaded}`\n"
         f"⏭️ **Skipped** : `{skipped}`\n"
         f"❌ **Failed** : `{failed}`"
     )
@@ -901,35 +577,14 @@ async def refresh_progress_callback(_, query):
 @bot.on_message(filters.command("killall") & filters.private)
 async def cancel_all_tasks(_, message: Message):
     cancelled = 0
-    # Clear state if any
     if message.from_user.id in BATCH_STATES:
         del BATCH_STATES[message.from_user.id]
-
+        
     for task in list(RUNNING_TASKS):
         if not task.done():
             task.cancel()
             cancelled += 1
     await message.reply(f"**Cancelled {cancelled} running task(s).**")
-
-
-@bot.on_message(filters.command("stop") & filters.private)
-async def stop_all_processes(_, message: Message):
-    global STOP_ALL_PROCESSES
-
-    STOP_ALL_PROCESSES = True
-    BATCH_STATES.clear()
-
-    cancelled = 0
-    for task in list(RUNNING_TASKS):
-        if not task.done():
-            task.cancel()
-            cancelled += 1
-
-    await message.reply(
-        "🛑 **Stop command executed.**\n"
-        f"Cancelled `{cancelled}` running task(s).\n"
-        "New downloads/batches are now blocked until process restart."
-    )
 
 
 async def initialize():
@@ -961,16 +616,12 @@ if __name__ == "__main__":
         LOGGER(__name__).info("Bot Started!")
         loop = asyncio.get_event_loop()
         
-        # Initialize semaphore
         loop.run_until_complete(initialize())
         
-        # Start the User Client
         user.start()
         
-        # Start the Dummy Web Server
         loop.run_until_complete(web_server())
         
-        # Start the Bot Client
         bot.run()
         
     except KeyboardInterrupt:
