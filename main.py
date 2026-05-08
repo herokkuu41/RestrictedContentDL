@@ -169,27 +169,33 @@ async def set_destination(bot: Client, message: Message):
 # -------------------------------------------------------------------------------------
 # CORE DOWNLOAD LOGIC
 # -------------------------------------------------------------------------------------
-async def handle_download(bot: Client, message: Message, post_url: str, silent: bool = False, pre_fetched_msg=None):
+async def handle_download(bot: Client, message: Message, post_url: str, silent: bool = False, pre_fetched_msg=None, abort_event: asyncio.Event = None):
+    # If abort signal is triggered globally, exit instantly.
+    if abort_event and abort_event.is_set():
+        return "aborted"
+
     async with download_semaphore:
+        if abort_event and abort_event.is_set():
+            return "aborted"
+            
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
 
         target_chat_id = DESTINATION_CHAT_ID if DESTINATION_CHAT_ID else message.chat.id
+        progress_message = None
 
         try:
             chat_id, message_id, thread_id = getChatMsgID(post_url)
             
-            # OPTIMIZATION: Use pre-fetched message if available to save API calls
             if pre_fetched_msg:
                 chat_message = pre_fetched_msg
             else:
                 chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
             
             LOGGER(__name__).info(f"Processing URL: {post_url}")
-            
             cloned = False
             
-            # ATTEMPT A: User Client Direct
+            # --- CLONE ATTEMPTS ---
             try:
                 if chat_message.media_group_id:
                     await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
@@ -197,10 +203,11 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 cloned = True
                 LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
+            except FloodWait as e:
+                raise e # DO NOT MASK FLOODWAIT!
             except Exception as e_user:
                 LOGGER(__name__).info(f"User direct clone failed: {e_user}")
 
-                # ATTEMPT B: Bot Client Direct
                 try:
                     if chat_message.media_group_id:
                         await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
@@ -208,84 +215,57 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                         await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                     cloned = True
                     LOGGER(__name__).info(f"Directly cloned via Bot: {post_url}")
+                except FloodWait as e:
+                    raise e
                 except Exception as e_bot:
                     LOGGER(__name__).info(f"Bot direct clone failed: {e_bot}")
 
-                    # ATTEMPT C: Relay (User -> Bot -> Destination)
                     try:
                         if not bot.me:
                             await bot.get_me()
-                        
                         bot_username = bot.me.username
-                        LOGGER(__name__).info(f"Attempting Relay Clone via {bot_username}...")
-
+                        
                         if chat_message.media_group_id:
-                            relayed_msgs = await user.copy_media_group(
-                                chat_id=bot_username,
-                                from_chat_id=chat_id,
-                                message_id=message_id
-                            )
+                            relayed_msgs = await user.copy_media_group(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
                             if relayed_msgs:
-                                await bot.copy_media_group(
-                                    chat_id=target_chat_id,
-                                    from_chat_id=bot.me.id,
-                                    message_id=relayed_msgs[0].id
-                                )
+                                await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msgs[0].id)
                         else:
-                            relayed_msg = await user.copy_message(
-                                chat_id=bot_username,
-                                from_chat_id=chat_id,
-                                message_id=message_id
-                            )
-                            await bot.copy_message(
-                                chat_id=target_chat_id,
-                                from_chat_id=bot.me.id,
-                                message_id=relayed_msg.id
-                            )
+                            relayed_msg = await user.copy_message(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
+                            await bot.copy_message(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msg.id)
                             try:
                                 await relayed_msg.delete()
                             except:
                                 pass
-
                         cloned = True
                         LOGGER(__name__).info(f"Relay clone success: {post_url}")
 
+                    except FloodWait as e:
+                        raise e
                     except Exception as e_relay:
                         LOGGER(__name__).info(f"Relay clone failed: {e_relay}")
 
             if cloned:
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
-                return 
+                return "success"
 
-            # FALLBACK: DOWNLOAD & UPLOAD
+            # --- FALLBACK: DOWNLOAD & UPLOAD ---
             if chat_message.document or chat_message.video or chat_message.audio:
                 file_size = (
-                    chat_message.document.file_size
-                    if chat_message.document
-                    else chat_message.video.file_size
-                    if chat_message.video
+                    chat_message.document.file_size if chat_message.document
+                    else chat_message.video.file_size if chat_message.video
                     else chat_message.audio.file_size
                 )
+                if not await fileSizeLimit(file_size, message, "download", user.me.is_premium):
+                    return "error"
 
-                if not await fileSizeLimit(
-                    file_size, message, "download", user.me.is_premium
-                ):
-                    return
-
-            parsed_caption = await get_parsed_msg(
-                chat_message.caption or "", chat_message.caption_entities
-            )
-            parsed_text = await get_parsed_msg(
-                chat_message.text or "", chat_message.entities
-            )
+            parsed_caption = await get_parsed_msg(chat_message.caption or "", chat_message.caption_entities)
+            parsed_text = await get_parsed_msg(chat_message.text or "", chat_message.entities)
 
             if chat_message.media_group_id:
                 if not await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id):
                     if not silent:
-                        await message.reply(
-                            "**Could not extract any valid media from the media group.**"
-                        )
-                return
+                        await message.reply("**Could not extract any valid media from the media group.**")
+                return "success"
 
             elif chat_message.media:
                 start_time = time()
@@ -296,7 +276,6 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     progress_action_str = f"📥 Downloading (ID: {message_id})"
                     prog_args = progressArgs(progress_action_str, progress_message, start_time)
                 else:
-                    progress_message = None
                     progress_func = None
                     prog_args = None
 
@@ -311,69 +290,84 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 
                 if not media_path or not os.path.exists(media_path):
                     if progress_message: await progress_message.edit("**❌ Download failed: File not saved properly**")
-                    return
+                    return "error"
 
                 file_size = os.path.getsize(media_path)
                 if file_size == 0:
                     if progress_message: await progress_message.edit("**❌ Download failed: File is empty**")
                     cleanup_download(media_path)
-                    return
+                    return "error"
 
                 LOGGER(__name__).info(f"Downloaded media: {media_path} (Size: {file_size} bytes)")
 
                 media_type = (
-                    "photo"
-                    if chat_message.photo
-                    else "video"
-                    if chat_message.video
-                    else "audio"
-                    if chat_message.audio
+                    "photo" if chat_message.photo
+                    else "video" if chat_message.video
+                    else "audio" if chat_message.audio
                     else "document"
                 )
                 
                 await send_media(
-                    bot,
-                    message,
-                    media_path,
-                    media_type,
-                    parsed_caption,
-                    progress_message, 
-                    start_time,
-                    destination_chat_id=target_chat_id
+                    bot, message, media_path, media_type, parsed_caption,
+                    progress_message, start_time, destination_chat_id=target_chat_id
                 )
 
                 cleanup_download(media_path)
                 
                 if progress_message:
                     await progress_message.delete()
+                    
+                return "success"
 
             elif chat_message.text or chat_message.caption:
                 if target_chat_id != message.chat.id:
                     await bot.send_message(target_chat_id, parsed_text or parsed_caption)
                 else:
                     await message.reply(parsed_text or parsed_caption)
+                return "success"
             else:
                 if not silent:
                     await message.reply("**No media or text found in the post URL.**")
+                return "error"
 
+        # --- GLOBAL ERROR HANDLING & ABORT LOGIC ---
         except FloodWait as e:
-            # Re-raise to break batch operations
-            raise e
+            if abort_event and not abort_event.is_set():
+                abort_event.set() # Trigger global shut down
+                await message.reply(f"🚨 **FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds. Process Aborted.")
+            if progress_message:
+                await progress_message.delete()
+            return "aborted"
+            
         except (PeerIdInvalid, BadRequest, KeyError):
+            if abort_event and abort_event.is_set(): return "aborted"
+            err = f"**Error processing {post_url}: User client likely not in chat.**"
             if not silent:
-                await message.reply(f"**Error processing {post_url}: User client likely not in chat.**")
+                if progress_message: await progress_message.edit(err)
+                else: await message.reply(err)
+            return "error"
+            
         except Exception as e:
             if "FLOOD_WAIT" in str(e).upper():
-                raise e # Re-raise if it's a flood wait masked inside another exception
+                if abort_event and not abort_event.is_set():
+                    abort_event.set()
+                    await message.reply(f"🚨 **FloodWait Triggered!**\nProcess Aborted.")
+                if progress_message:
+                    await progress_message.delete()
+                return "aborted"
+                
+            if abort_event and abort_event.is_set(): return "aborted"
             
             error_message = f"**❌ Error at {post_url}: {str(e)}**"
             if not silent:
-                await message.reply(error_message)
+                if progress_message: await progress_message.edit(error_message)
+                else: await message.reply(error_message)
             LOGGER(__name__).error(e)
+            return "error"
 
 
 @bot.on_message(filters.command("dl") & filters.private)
-async def download_media(bot: Client, message: Message):
+async def download_media_cmd(bot: Client, message: Message):
     if len(message.command) < 2:
         await message.reply("**Provide a post URL after the /dl command.**")
         return
@@ -437,17 +431,16 @@ async def handle_text_and_states(bot: Client, message: Message):
         try:
             await track_task(handle_download(bot, message, message.text, silent=False))
         except FloodWait as e:
-            await message.reply(f"🚨 **FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds.")
+            await message.reply(f"🚨 **FloodWait Triggered!**\nWait `{e.value}` seconds.")
 
 
-# Helper to run the batch loop
+# Helper to run the batch loop (NOW HIGHLY OPTIMIZED WITH BULK FETCH)
 async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int):
     try:
         start_chat, start_id, start_thread_id = getChatMsgID(start_link)
     except Exception as e:
         return await message.reply(f"**❌ Error parsing start link:\n{e}**")
 
-    # Calculate End ID
     end_id = start_id + count - 1
     prefix = start_link.rsplit("/", 1)[0]
     
@@ -460,108 +453,94 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     )
 
     downloaded = skipped = failed = 0
-    skipped_streak = 0
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
-    batch_aborted = False
+    
+    abort_event = asyncio.Event() # Shared flag to shut everything down
 
-    for msg_id in range(start_id, end_id + 1):
-        if batch_aborted:
+    all_message_ids = list(range(start_id, end_id + 1))
+    chunk_size = 50 # Fetch 50 messages per API call (Instant skipping)
+
+    for i in range(0, len(all_message_ids), chunk_size):
+        if abort_event.is_set():
             break
             
-        url = f"{prefix}/{msg_id}"
+        chunk = all_message_ids[i:i+chunk_size]
+        
         try:
-            try:
-                # API Call #1: Fetch message to check existence & type
-                chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
-            except FloodWait as e:
-                await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds. The process has been safely stopped to protect your account.")
-                batch_aborted = True
+            # OPTIMIZATION: Fetch in bulk to save API rate limits!
+            messages_batch = await user.get_messages(chat_id=start_chat, message_ids=chunk)
+        except FloodWait as e:
+            await message.reply(f"🚨 **Batch Halted: Read FloodWait Triggered!**\nWait `{e.value}` seconds.")
+            abort_event.set()
+            break
+        except Exception as e:
+            if "FLOOD_WAIT" in str(e).upper():
+                 await message.reply(f"🚨 **Batch Halted: Read FloodWait Triggered!**")
+                 abort_event.set()
+                 break
+            failed += len(chunk)
+            continue
+
+        if getattr(messages_batch, "id", None) is not None:
+             messages_batch = [messages_batch]
+
+        for chat_msg in messages_batch:
+            if abort_event.is_set():
                 break
 
             if not chat_msg or getattr(chat_msg, 'empty', False):
                 skipped += 1
-                skipped_streak += 1
-                if skipped_streak >= BATCH_SIZE:
-                    await asyncio.sleep(4)
-                    skipped_streak = 0
                 continue
 
-            # ------------- TOPIC FILTERING -------------
             if start_thread_id:
                 msg_thread = getattr(chat_msg, "message_thread_id", None)
                 if msg_thread != start_thread_id:
                     skipped += 1
-                    skipped_streak += 1
-                    if skipped_streak >= BATCH_SIZE:
-                        await asyncio.sleep(4)
-                        skipped_streak = 0
                     continue
-            # ------------------------------------------------
 
             has_media = bool(chat_msg.media_group_id or chat_msg.media)
             has_text  = bool(chat_msg.text or chat_msg.caption)
             if not (has_media or has_text):
                 skipped += 1
-                skipped_streak += 1
-                if skipped_streak >= BATCH_SIZE:
-                    await asyncio.sleep(4)
-                    skipped_streak = 0
                 continue
-            skipped_streak = 0
 
-            # OPTIMIZATION: Pass the already fetched chat_msg to prevent a redundant API call inside
-            task = track_task(handle_download(bot, message, url, silent=False, pre_fetched_msg=chat_msg))
+            url = f"{prefix}/{chat_msg.id}"
+            task = track_task(handle_download(
+                bot, message, url, 
+                silent=False, 
+                pre_fetched_msg=chat_msg, 
+                abort_event=abort_event # Pass the global abort flag
+            ))
             batch_tasks.append(task)
 
             if len(batch_tasks) >= BATCH_SIZE:
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-                
                 for result in results:
-                    if isinstance(result, asyncio.CancelledError):
-                        await loading.delete()
-                        return await message.reply(f"**❌ Batch canceled** after processing `{downloaded}` posts.")
-                    elif isinstance(result, FloodWait):
-                        await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**\nTelegram requires a wait of `{result.value}` seconds. The process has been safely stopped.")
-                        batch_aborted = True
-                        break
-                    elif isinstance(result, Exception):
-                        if "FLOOD_WAIT" in str(result).upper():
-                            await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**\nThe process has been safely stopped to protect your account.")
-                            batch_aborted = True
-                            break
-                        failed += 1
-                        LOGGER(__name__).error(f"Error in batch gather: {result}")
-                    else:
+                    if result == "aborted" or abort_event.is_set():
+                        pass 
+                    elif result == "success":
                         downloaded += 1
-
+                    else:
+                        failed += 1
+                
                 batch_tasks.clear()
-                if not batch_aborted:
+                if not abort_event.is_set():
                     await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
-        except Exception as e:
-            if "FLOOD_WAIT" in str(e).upper():
-                 await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**")
-                 batch_aborted = True
-                 break
-            failed += 1
-            LOGGER(__name__).error(f"Error at {url}: {e}")
-
-    # Clear out remaining tasks if batch wasn't aborted
-    if batch_tasks and not batch_aborted:
+    if batch_tasks and not abort_event.is_set():
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
         for result in results:
-            if isinstance(result, FloodWait) or ("FLOOD_WAIT" in str(result).upper() if isinstance(result, Exception) else False):
-                await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**")
-                break
-            elif isinstance(result, Exception):
-                failed += 1
-            else:
+            if result == "aborted" or abort_event.is_set():
+                pass
+            elif result == "success":
                 downloaded += 1
+            else:
+                failed += 1
 
     await loading.delete()
     
-    completion_text = "**✅ Batch Process Complete!**" if not batch_aborted else "**🛑 Batch Process Stopped (FloodWait)**"
+    completion_text = "**✅ Batch Process Complete!**" if not abort_event.is_set() else "**🛑 Batch Process Stopped (FloodWait)**"
     
     await message.reply(
         f"{completion_text}\n"
